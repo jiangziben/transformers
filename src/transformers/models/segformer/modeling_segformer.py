@@ -52,6 +52,9 @@ _IMAGE_CLASS_CHECKPOINT = "nvidia/mit-b0"
 _IMAGE_CLASS_EXPECTED_OUTPUT = "tabby, tabby cat"
 
 
+from ..deprecated._archive_maps import SEGFORMER_PRETRAINED_MODEL_ARCHIVE_LIST  # noqa: F401, E402
+
+
 class SegFormerImageClassifierOutput(ImageClassifierOutput):
     """
     Base class for outputs of image classification models.
@@ -795,34 +798,44 @@ class SegformerForSemanticSegmentation(SegformerPreTrainedModel):
         encoder_hidden_states = outputs.hidden_states if return_dict else outputs[1]
 
         logits = self.decode_head(encoder_hidden_states)
+        if torch.onnx.is_in_onnx_export():
+            semantic_segmentation = []
 
-        loss = None
-        if labels is not None:
-            # upsample logits to the images' original size
-            upsampled_logits = nn.functional.interpolate(
-                logits, size=labels.shape[-2:], mode="bilinear", align_corners=False
+            for idx in range(logits.shape[0]):
+                resized_logits = torch.nn.functional.interpolate(
+                    logits[idx].unsqueeze(dim=0), size=pixel_values.shape[2:], mode="bilinear", align_corners=False
+                )
+                semantic_map = resized_logits[0].argmax(dim=0)
+                semantic_segmentation.append(semantic_map)
+                return semantic_segmentation
+        else:    
+            loss = None
+            if labels is not None:
+                # upsample logits to the images' original size
+                upsampled_logits = nn.functional.interpolate(
+                    logits, size=labels.shape[-2:], mode="bilinear", align_corners=False
+                )
+                if self.config.num_labels > 1:
+                    loss_fct = CrossEntropyLoss(ignore_index=self.config.semantic_loss_ignore_index)
+                    loss = loss_fct(upsampled_logits, labels)
+                elif self.config.num_labels == 1:
+                    valid_mask = ((labels >= 0) & (labels != self.config.semantic_loss_ignore_index)).float()
+                    loss_fct = BCEWithLogitsLoss(reduction="none")
+                    loss = loss_fct(upsampled_logits.squeeze(1), labels.float())
+                    loss = (loss * valid_mask).mean()
+                else:
+                    raise ValueError(f"Number of labels should be >=0: {self.config.num_labels}")
+
+            if not return_dict:
+                if output_hidden_states:
+                    output = (logits,) + outputs[1:]
+                else:
+                    output = (logits,) + outputs[2:]
+                return ((loss,) + output) if loss is not None else output
+
+            return SemanticSegmenterOutput(
+                loss=loss,
+                logits=logits,
+                hidden_states=outputs.hidden_states if output_hidden_states else None,
+                attentions=outputs.attentions,
             )
-            if self.config.num_labels > 1:
-                loss_fct = CrossEntropyLoss(ignore_index=self.config.semantic_loss_ignore_index)
-                loss = loss_fct(upsampled_logits, labels)
-            elif self.config.num_labels == 1:
-                valid_mask = ((labels >= 0) & (labels != self.config.semantic_loss_ignore_index)).float()
-                loss_fct = BCEWithLogitsLoss(reduction="none")
-                loss = loss_fct(upsampled_logits.squeeze(1), labels.float())
-                loss = (loss * valid_mask).mean()
-            else:
-                raise ValueError(f"Number of labels should be >=0: {self.config.num_labels}")
-
-        if not return_dict:
-            if output_hidden_states:
-                output = (logits,) + outputs[1:]
-            else:
-                output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SemanticSegmenterOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states if output_hidden_states else None,
-            attentions=outputs.attentions,
-        )
